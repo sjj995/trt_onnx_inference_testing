@@ -16,6 +16,8 @@ from datetime import timedelta
 import datetime
 import tqdm
 import warnings
+import pandas as pd
+import json
 
 
 def get_args():
@@ -40,6 +42,13 @@ def get_args():
         type=boolean,
         default=False,
         help="decide save TensorRT model(T/F)"
+    )
+
+    parser.add_argument(
+        "--target_path",
+        type=str,
+        default=os.getcwd()+'/report.json',
+        help="reporting comparison results"
     )
 
     return parser.parse_args()
@@ -70,19 +79,26 @@ def to_numpy(tensor):
     return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
 
 
-class Comparision(object):
-    def __init__(self,onnx_output,trt_output):
+class Comparison(object):
+    model_dict = {}
+    def __init__(self,input_name,input_shape,output_name,output_shape,model_name,onnx_output,trt_output):
+        self.input_name = input_name
+        self.input_shape = input_shape
+        self.output_name = output_name
+        self.output_shape = output_shape
+        self.model_name = model_name
         self.onnx_output = onnx_output
         self.trt_output = trt_output
-        self.atol = 1e-06
+        self.atol = 1e-04
         self.rtol = 1e-05
         self.rel_diff_propotion = None
         self.abs_diff_propotion = None
         self.max_value = -math.inf
         self.max_pos = None
-        self.do_comparsion()
+        self.do_comparison()
+        self.reporting()
 
-    def do_comparsion(self):
+    def do_comparison(self):
         self.max_value = abs(self.onnx_output-self.trt_output).max()
         self.max_pos = np.where(abs(self.onnx_output-self.trt_output) == self.max_value)
 
@@ -92,17 +108,22 @@ class Comparision(object):
         abs_diff = np.isclose(self.onnx_output,self.trt_output,atol=self.atol)
         self.abs_diff_propotion = ((abs_diff == True).sum() / np.size(abs_diff))
   
-    def __str__(self):
+    def reporting(self):
+        #model_name : [input_name] [input_shape] [output_name]
+        Comparison.model_dict[self.model_name] = [self.input_name,str(self.input_shape),self.output_name,str(self.output_shape),self.abs_diff_propotion, \
+            self.rel_diff_propotion,str(self.max_value),str((self.max_pos[0][0],self.max_pos[1][0]))]
+
+#     def __str__(self):
+# #         return f"""Tolerance : [abs={self.atol}, rel={self.rtol}]
+# # Absolute Difference : {round(self.abs_diff_propotion*100.0,4)}% || Relative Difference : {round(self.rel_diff_propotion*100.0,4)}%
+# # Max Difference : {self.max_value} || Max Difference Position {self.max_pos[0][0],self.max_pos[1][0]}"""
 #         return f"""Tolerance : [abs={self.atol}, rel={self.rtol}]
 # Absolute Difference : {round(self.abs_diff_propotion*100.0,4)}% || Relative Difference : {round(self.rel_diff_propotion*100.0,4)}%
-# Max Difference : {self.max_value} || Max Difference Position {self.max_pos[0][0],self.max_pos[1][0]}"""
-        return f"""Tolerance : [abs={self.atol}, rel={self.rtol}]
-Absolute Difference : {round(self.abs_diff_propotion*100.0,4)}% || Relative Difference : {round(self.rel_diff_propotion*100.0,4)}%
-Max Difference : {self.max_value} || Max Difference Position {self.max_pos[0][0],self.max_pos[1][0]}
-================================================================================="""
+# Max Difference : {self.max_value} || Max Difference Position {self.max_pos[0][0],self.max_pos[1][0]}
+# ================================================================================="""
 
-    def __repr__(self):
-        return self.__str__()
+#     def __repr__(self):
+#         return self.__str__()
 
 
 class EvaluateOnnx(object):
@@ -138,6 +159,7 @@ class EvaluateOnnx(object):
         
         input_name = session.get_inputs()[0].name
         input_shape = session.get_inputs()[0].shape
+        output_name = session.get_outputs()[0].name
         output_shape = session.get_outputs()[0].shape
 
         x = MakeDataset(input_shape)
@@ -145,7 +167,7 @@ class EvaluateOnnx(object):
         ort_inputs = {session.get_inputs()[0].name: to_numpy(x)}
         ort_outs = session.run(None, ort_inputs)
      
-        return input_name,input_shape,output_shape,x,ort_outs[0]
+        return input_name,input_shape,output_name,output_shape,x,ort_outs[0]
 
 
 class OnnxToTensorRT(object):
@@ -259,6 +281,12 @@ class EvaluateTRT(object):
         input_data = to_numpy(self.input_data)
         for input in self.inputs:
             np.copyto(input.host,np.ravel(input_data))
+            #   np.copyto(input.host,input_data)
+
+        # input이나 output이 여러개일 때 고려해야됨 추후에
+        # host output을 inference 들어가기 전에 reshape
+        for output in self.outputs:
+            output.host.resize(self.output_shape)
 
     # This function is generalized for multiple inputs/outputs for full dimension networks.
     # inputs and outputs are expected to be lists of HostDeviceMem objects.
@@ -270,13 +298,12 @@ class EvaluateTRT(object):
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
         # Transfer predictions back from the GPU.
         [cuda.memcpy_dtoh_async(out.host, out.device, self.stream) for out in self.outputs]
+    
         # Synchronize the stream
         self.stream.synchronize()
-        # Return only the host outputs.
-        # output shape 를 어떻게 함?
-        #return [out.host for out in self.outputs][0][np.newaxis,:]
-        #trt_outputs =  [out.host for out in self.outputs]
-        trt_outputs = [output.reshape(shape) for output, shape in zip([out.host for out in self.outputs],[self.output_shape])]
+        
+        #trt_outputs = [output.reshape(shape) for output, shape in zip([out.host for out in self.outputs],[self.output_shape])]
+        trt_outputs = [out.host for out in self.outputs]
         return trt_outputs[0]
   
 
@@ -287,14 +314,17 @@ def main():
     onnx_root_path = args.onnx_model_path
     onnx_models = get_onnx_files(onnx_root_path)
     trt_model_save_path = args.trt_model_save_path
-
+    target_path = args.target_path
+    final_report = {}
+    
     for om in onnx_models:
         tensorrt_file_name = Path(om).stem+'.trt'
+        model_name = Path(om).stem
         trt_save_flag = args.save_trt_model
 
         start = time.process_time()
         EvalOnnx = EvaluateOnnx(om)
-        input_name,input_shape,output_shape,onnx_input,onnx_output = EvalOnnx.do_onnx_inference()
+        input_name,input_shape,output_name,output_shape,onnx_input,onnx_output = EvalOnnx.do_onnx_inference()
         end = time.process_time()
         print('\033[96m'+"[COMPLETE] ONNX Model Inference :", end - start,"(s)"+'\033[0m')
 
@@ -310,10 +340,15 @@ def main():
         end = time.process_time()
         print('\033[96m'+"[COMPLETE] TensorRT Model Inference :", end - start,"(s)"+'\033[0m')
 
-        res = Comparision(onnx_output,trt_output)
+        res = Comparison(input_name,input_shape,output_name,output_shape,model_name,onnx_output,trt_output)
         now = datetime.datetime.now()
         print('\033[32m'+'[Final Report] : ['+Path(om).stem+' - '+(now.strftime("%c"))+']'+'\033[0m')
-        print(res)
+        print(res.model_dict)
+        final_report = res.model_dict
+
+
+    with open(target_path,'w',encoding='utf-8') as f:
+        json.dump(final_report,f,indent=4)
     
     return
 
